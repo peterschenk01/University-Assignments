@@ -1,0 +1,388 @@
+---
+title: "IM110 -- `stsh`: Stanford Shell"
+toc-depth: 4
+---
+
+## Written Questions
+
+::: {.callout-important}
+Only submit your solution for the programming assignment (next section).
+:::
+
+### Incorrect Output File Redirection
+
+The `publish` user program below takes an arbitrary number of filenames as arguments and attempts to publish the date and time (via the `date` executable that ships with all versions of Unix and Linux). `publish` is built from the following source:
+
+``` {.cpp}
+static void publish(const char *name) {
+   printf("Publishing date and time to file named \"%s\".\n", name);
+   int outfile = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   dup2(outfile, STDOUT_FILENO);
+   close(outfile);
+   if (fork() > 0) return;
+   char *argv[] = { "date", NULL };
+   execvp(argv[0], argv);
+}
+ 
+int main(int argc, char *argv[]) {
+   for (size_t i = 1; i < argc; i++) publish(argv[i]);
+   return 0;
+}
+```
+
+Someone with a fractured understanding of processes, descriptors, and `dup2` might expect the program to have printed something like this:
+
+``` {.bash}
+$ ./publish one two three four
+Publishing date and time to file named "one".
+Publishing date and time to file named "two".
+Publishing date and time to file named "three".
+Publishing date and time to file named "four".
+```
+
+However, that’s not what happens. Questions:
+
+* What text is actually printed to standard output?
+
+* What do each of the four files contain? 
+
+* How should the program be rewritten so that it works as intended?
+
+### Parallel Mergesort
+
+Consider the following implementation of merge sort. It launches 128 peer processes to cooperatively sort an array of 128 randomly generated numbers
+
+``` {.cpp}
+#include "memory.h"
+#include <cstdlib>
+#include <cassert>
+#include <algorithm>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+static bool shouldKeepMerging(size_t start, size_t reach, size_t length) {
+  return start % reach == 0 && reach <= length;
+}
+
+static void repeatedlyMerge(int numbers[], size_t length, size_t start) {
+  int *base = numbers + start;
+  for (size_t reach = 2; shouldKeepMerging(start, reach, length); reach *= 2) {
+    raise(SIGSTOP);
+    inplace_merge(base, base + reach/2, base + reach);
+  }
+  exit(0);
+}
+
+static void createMergers(int numbers[], pid_t workers[], size_t length) {
+  for (size_t start = 0; start < length; start++) {
+    workers[start] = fork();
+    if (workers[start] == 0) 
+      repeatedlyMerge(numbers, length, start);
+  }
+}
+
+static void orchestrateMergers(int numbers[], pid_t workers[], size_t length) {
+  size_t step = 1;
+  while (step <= length) {
+    for (size_t start = 0; start < length; start += step) 
+      waitpid(workers[start], NULL, WUNTRACED);
+    step *= 2;
+    for (size_t start = 0; start < length; start += step) 
+      kill(workers[start], SIGCONT);
+  }
+}
+
+static void mergesort(int numbers[], size_t length) {
+  pid_t workers[length];
+  createMergers(numbers, workers, length);
+  orchestrateMergers(numbers, workers, length);
+}
+
+static const size_t kNumElements = 128;
+int main(int argc, char *argv[]) {
+  for (size_t trial = 1; trial <= 10000; trial++) {
+    int *numbers = createSharedArray(kNumElements);    
+    mergesort(numbers, kNumElements);
+    bool sorted = is_sorted(numbers, numbers + kNumElements);
+    cout << "\rTrial #" << setw(5) << setfill('0') << trial << ": " 
+         << (sorted ? "\033[1;34mSUCCEEDED!\033[0m" : "\033[1;31mFAILED!   \033[0m") << flush;
+    freeSharedArray(numbers, kNumElements);
+    if (!sorted) { cout << endl << "mergesort is \033[1;31mBROKEN.... please fix!\033[0m" << flush; break; }
+  }
+  cout << endl;
+  return 0;
+}
+```
+The above program works because the address stored in the `numbers` variable is cloned across the 128 fork calls, and this particular address maps to the same set of physical addresses in all 128 processes (and that’s different than what usually happens). The relevant code for this behavior can be found in `memory.cc`:
+
+``` {.cpp}
+#include "memory.h"
+#include <sys/mman.h>
+#include "random-generator.h"
+#include <iostream>
+using namespace std;
+
+static const unsigned int kMinValue = 100;
+static const unsigned int kMaxValue = 999;
+
+/**
+ * Function: createSharedArray
+ * ---------------------------
+ * Dynamically allocates an integer array of the specified
+ * length, populates each entry with a random number drawn
+ * from [kMinValue, kMaxValue], and then returns the
+ * base address of the array.
+ *
+ * Note the array isn't allocated in the heap, but in another
+ * segment created specifically for the purposes of this library.
+ * Furthermore, the array is set up so that one copy is shared
+ * across all fork boundaries (in contrast to the deep copies
+ * that normally come with fork).
+ */
+int *createSharedArray(size_t length) {
+  int *numbers =
+    static_cast<int *>(mmap(NULL, length * sizeof(int), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+  RandomGenerator rgen;
+  for (size_t i = 0; i < length; i++) 
+    numbers[i] = rgen.getNextInt(kMinValue, kMaxValue);
+  return numbers;
+}
+
+void freeSharedArray(int *array, size_t length) {
+  munmap(array, length * sizeof(int));
+}
+```
+You need to understand, what `mmap` does here. Also, compile the overall program (define the necessary `memory.h` yourself) utilizing one more file, `random-generator.h`:
+
+``` {.cpp}
+#include <cstdlib>        // provides srandom, random (which we pretend are thread-safe, even though they aren't
+#include <time.h>
+
+class RandomGenerator
+{
+    public:
+        RandomGenerator(){
+            srand(time(NULL));
+        }
+    unsigned int getNextInt(unsigned int l, unsigned int h){
+            return rand()%(h-l)+l;
+        }
+    bool getNextBool(double h){
+        int c = rand()%10;
+        if (c<= h*10) return true;
+        else return false;
+        }
+};
+```
+
+The program successfully sorts any array of length 128 by relying on 128 independent processes. Using the code above, reiterate the principle of mergesort again. Then answer the following questions:
+
+* Why is the `raise(SIGSTOP)` line within the implementation of `repeatedlyMerge` necessary?
+
+* When the implementation of orchestrateMergers executes the step *= 2; line the very first time, all worker processes have either terminated or self-halted.  Explain why that’s guaranteed.
+
+* The repeatedlyMerge function relies on a reach parameter, and the orchestrateMergers function relies on a step parameter.  Each of the two parameters doubles with each iteration.  What are the two parameters accomplishing?
+
+* Had we replaced the one use of WUNTRACED with a 0, would the overall program still correctly sort an arbitrary array of length 128?  Why or why not?
+
+* Had we instead replaced the one use of WUNTRACED with WUNTRACED | WNOHANG instead, would the overall program still correctly sort an arbitrary array of length 128?  Why or why not?
+
+* Assume the following implementation of orchestrateMergers replaces the original version.  Would the overall program always successfully sort an arbitrary array of length 128?  Why or why not?
+
+  ``` {.cpp}
+  static void orchestrateMergers(int numbers[], pid_t workers[], size_t length) {
+  for (size_t step = 1; step <= length; step *= 2) {
+    for (size_t start = 0; start < length; start += step) {
+      int status;
+      waitpid(workers[start], &status, WUNTRACED);
+      if (WIFSTOPPED(status)) kill(workers[start], SIGCONT);
+      }
+    }
+  }
+  ```
+
+## Implementation
+
+::: {.callout-important}
+The (overall) text and the associated code is a blatant copy of [CS110 Assignment 4](https://quip.com/BZueAMXaJumx)
+
+Read through the complete assignment first before starting to code.
+:::
+
+::: {.callout-warning}
+This assignment is designed to run only on linux-alike Operating Systems.
+:::
+
+The starter code implements a rudimentary *read-eval-print loop* ([REPL](https://en.wikipedia.org/wiki/Read%E2%80%93eval%E2%80%93print_loop)), and the requirement for you is to add to it to build out your very own shell program. It’s definitely worth `make`-ing the starter code and playing with the compilation product to see what it already does.
+
+You should know your way around a shell before implementing your own. You are probably familiar with the following things in whatever shell you’re normally presented with when you log into a linux machine:
+
+* You can create a pipeline of processes with the pipe (`|`) operator. If you want to see how many files you have whose names contain "vector", for instance, you can do this:
+  ``` {.bash}
+    ls -l | grep vector | wc -l
+  ```
+  The output of the first process is piped to the stdin of the second, and the output of the second process is piped to the stdin of the third.
+
+* You can run a command in the background by adding a trailing ampersand (`&`):
+
+  ``` {.bash}
+  sleep 5 &
+  ```
+
+  The shell will immediately print a prompt, not waiting for that command to finish. However, it keeps track of the child processes’ state in order to maintain a job list (which you can see by typing `jobs`)
+
+* You can interrupt a foreground job by pressing `ctrl-c`.  Usually, though not always, `ctrl-c` kills the process.
+
+* You can suspend a foreground job by pressing `ctrl-z`. This sends `SIGTSTP` to all foreground processes, temporarily stopping them until they’re sent `SIGCONT`. To resume the last suspended process, you can type `fg` in your shell (or `bg` to continue the process, but relegate it to the background).
+
+### Learning Goals
+
+* To further advance your multiprocessing system calls understanding —- e.g. `fork`, `waitpid`, `execvp`, enabling the management of an arbitrary number of processes executing different programs.
+
+* Improve your grasp of interprocess communication and file I/O mechanisms, including pipes, pipelines, file redirection, and system calls like, `pipe2`, `open`, and `dup2`.
+
+* Develop practical experience handling signals common to multiprocessing environments—specifically, `SIGCHLD`, `SIGINT`, and `SIGTSTP`.
+
+* To synchronously manage signal delivery via `sigwait` and inline signal handers.
+
+### Builtin `stsh` Commands
+
+Your shell needs to support a collection of builtin commands that should execute **without** creating any new processes. The builtins are:
+
+* `quit`, which exits the shell and abandons any jobs that were still running. If there are any extraneous arguments after the quit, just ignore them.
+    
+* `exit`, which does the same thing as `quit`. Extraneous arguments? Just ignore them.
+
+* `fg`, which prompts a stopped job to continue in the foreground or brings a running background job into the foreground. `fg` takes a single job number (e.g. `fg 3`). If the provided argument isn’t a number, there’s no such job with that number, or the number of arguments isn’t correct, then throw an `STSHException` around an actionable error message and allow your shell to carry on as if you never typed anything.
+
+* `bg`, which prompts a stopped job to continue in the background. `bg` takes a single job number (e.g. `bg 3`). If the provided argument isn’t a number, there’s no such job with that number, or the number of arguments isn’t correct, then throw an `STSHException` around an actionable error message and allow your shell to carry on as if you never typed anything.
+
+* `slay`, which is used to terminate a single process (which may have many sibling processes as part of a larger pipeline). `slay` takes either one or two numeric arguments. If only one number is provided, it’s assumed to be the pid of the process to be killed. If two numbers are provided, the first number is assumed to be the job number, and the second is assumed to be a process index within the job. So, `slay 12345` would terminate (in the `SIGKILL` sense of terminate) the process with pid `12345`. `slay 2 0` would terminate the first process in the pipeline making up job 2. `slay 13 8` would terminate the 9th process in the pipeline of processes making up job 13. If there are any issues (e.g., the arguments aren’t numbers, or they are numbers but identify some nonexistent process, or the argument count is incorrect), then throw an `STSHException` around an actionable error message and allow your shell to carry on as if you never typed anything.
+
+* `halt`, which has nearly the same story as `slay`, except that its one or two numeric arguments identify a single process that should be halted (but not terminated) if it isn’t already stopped. If it’s already stopped, then don’t do anything and just return.
+
+`cont`, which has the same story as `slay` and `halt`, except that its one or two numeric arguments identify a single process that should continue if it isn’t already running. If it’s already running, then don’t do anything and just return. When you prompt a single process to continue, you’re asking that it do so in the background.
+
+* `jobs`, which prints the job list to the console. If there are any additional arguments, then just ignore them.
+
+* `quit`, `exit`, and `jobs` are already implemented for you. You’re responsible for implementing the others and ensuring the global job list is appropriately updated.
+
+### Getting Started
+
+Inspect the `stsh.cc` file in the repository. This is the only file you should need to modify. The core main function you’re provided looks like this:
+
+``` {.cpp}
+int main(int argc, char *argv[]) {
+    pid_t stshpid = getpid();
+    installSignalHandlers();
+    rlinit(argc, argv); // configures stsh-readline library so readline works properly
+    while (true) {
+        string line;
+        if (!readline(line)) break;
+        if (line.empty()) continue;
+        try {
+            pipeline p(line);
+            bool builtin = handleBuiltin(p);
+            if (!builtin) createJob(p); // createJob is initially defined as a wrapper around cout << p;
+        } catch (const STSHException& e) {
+            cerr << e.what() << endl;
+            if (getpid() != stshpid) exit(0); // if exception is thrown from child process, kill it
+        }
+    }
+
+    return 0;
+}
+```
+
+The `readline` function prompts the user to enter a command and a pipeline record is constructed around it. `readline` and `pipeline` are implemented via a suite of files in the `stsh-parser subdirectory`, and for the most part you can ignore those implementations. You should, however, be familiar with the type definitions of the `command` and `pipeline` types, though:
+
+``` {.cpp}
+const size_t kMaxCommandLength = 32;
+const size_t kMaxArguments = 32;
+struct command {
+  char command[kMaxCommandLength + 1]; // '\0' terminated
+  char *tokens[kMaxArguments + 1]; // NULL-terminated array, C strings are all '\0' terminated
+};
+
+struct pipeline {
+  std::string input;   // empty if no input redirection file to first command
+  std::string output;  // empty if no output redirection file from last command
+  std::vector<command> commands;
+  bool background;
+  
+  pipeline(const std::string& str);
+  ~pipeline();
+};
+```
+
+Check out what the initial version of `stsh` is capable of before you add any new code.
+
+### Milestones
+
+The best approach to implementing anything this complex is to invent a collection of milestones that advance you toward your final goal. Never introduce more than a few lines of code before compiling and confirming that the lines you added do what you expect. View everything you add as a slight perturbation to a working system that slowly evolves into the final product. Try to understand every single line you add, why it’s needed, and why it belongs where you put it.
+
+Here is a sequence of milestones you should work through:
+
+1. Descend into the `stsh-parser` directory, read through the `stsh-readline.h` and `stsh-parse.h` header files for data type definitions and function/method prototypes, type `make`, and play with the `stsh-parse-test` to gain a sense of what `readline` and the `pipeline` constructor do for you. In general, the `readline` function is like `getline`, except that you can use your up and down arrows to scroll through your history of inputs!!!. The `pipeline` record defines a bunch of fields that store all of the various commands that chain together to form a pipeline. For example, the text `cat < /usr/include/stdio.h | wc > output.txt` would be split into two commands – one for the `cat` and a second for the `wc` – and populate the `vector<command>` in the pipeline with information about each of them. The `input` and `output` fields would each be nonempty, and the background field would be `false`.
+
+2. Get a pipeline of just one command (e.g. `sleep 5`) to run in the foreground until it’s finished. Rely on a call to `waitpid` to stall `stsh` until the foreground job finishes. Ignore the job list, ignore the `SIGCHLD` handler, don’t worry about background jobs, pipelining, or redirection. Don’t worry about programs like `emacs` just yet. Focus on these executables instead: `ls`, `date`, `sleep`, as their execution is well understood and predictable.
+
+3. Establish the process group ID of the job to be the PID of the process by investigating the setpgid system call. When you run `stsh` from the standard Unix shell, note that `stsh` is running in the foreground. If your shell then creates a child process, by default that child will also be a member of the foreground process group as well, and you don’t want that. Since typing `ctrl-c` sends a `SIGINT` to every process in the foreground group, typing `ctrl-c` will send a `SIGINT` to your shell, as well as to every process that your shell created, and you don’t want that. The notion of a group ID isn’t all that important yet, because at the moment, a process group consists of only one process. But we’ll eventually be dealing with jobs comprised of many processes in a pipeline, and we’ll want a single process group id to represent all of them.
+
+4. Read through `stsh-job-list.h`, `stsh-job.h`, and `stsh-process.h` to learn how to add a new foreground job to the job list, and how to add a process to that job. Add code that does exactly that to the `stsh.cc` file, right after you successfully fork off a new process. After your `waitpid` call returns, remove the job from the job list. If it helps, inline `cout << joblist;` lines in strategically chosen locations to confirm your new job is being added after `fork` and being removed after `waitpid`.
+
+5. Implement the `SIGCHLD` handler to reap the resources of a foreground process after it exits, and suspend stsh’s main thread of execution using a `sigset_t`, `sigprocmask`, `sigsuspend`, and related functions until an examination of the job list proves that the foreground job is no longer the foreground job. Your call to `waitpid` should be moved into the `SIGCHLD` handler and that should be the only place in your entire solution with a `waitpid` call.
+
+6. Install functions to activate `ctrl-z` and `ctrl-c` on your keyboard to stop and kill the foreground process instead of the shell itself. If, for instance, a `sleep 500` is running as the foreground, you may want to kill the process by pressing `ctrl-c`. When you press `ctrl-c`, the OS sends a `SIGINT` to your shell, which unless handled will terminate your shell. If, however, you install a function to handle `SIGINT`, then that handler can (and should) forward the `SIGINT` on to the foreground job, should one exist. The story for `ctrl-z` is similar, except `ctrl-z` prompts the OS to send your shell a `SIGTSTP`. If you install a custom handler to intercept a `SIGTSTP`, you can forward the `SIGTSTP` on to the foreground job, should one exist. In these cases, the `kill` function will contribute to your implementation of both of these handlers.
+
+7. Implement the `fg` builtin, which takes a stopped process – stopped presumably because it was running in the foreground at the time you pressed `ctrl-z` – and prompts it to continue, or it takes a process running in the background and brings it into the foreground. The `fg` builtin takes job number, translates that job number to a process group ID, and, if necessary, forwards a `SIGCONT` on to the process group via a call to `kill(-groupID, SIGCONT)`. Right now, process groups consist of just one process, but once you start to support pipelines (e.g. `cat words.txt | sort | uniq | wc -l`), you’ll want `fg` to bring the entire job into the foreground, and if all relevant processes are part of the same process group, you can achieve this with a single kill call. Of course, if the argument passed to fg isn’t a number, or it is but it doesn’t identify a real job, then you should throw an `STSHException` that’s wrapped around a clear error message saying so.
+
+8. Update the `SIGCHLD` handler to detect state changes in all processes under `stsh`’s jurisdiction. Processes can exit gracefully, exit abnormally because of some signal, or be terminated by `ctrl-c`. Processes can halt because of a signal or a `ctrl-z`. And processes can continue because of a signal or an `fg` builtin. The job list needs to remain in sync with the state of your shell’s world, and `waitpid` is the perfect function to tell you about changes. You’re already familiar with `WNOHANG`, `WUNTRACED`, `WIFEXITED`, `WEXITSTATUS`, etc. Read through `waitpid`’s man page to get word on some Linux-specific flags and macros that tell you about processes that have started executing again. Buzzwords include `WCONTINUED` and `WIFCONTINUED`, so read up on those.
+
+9. Add support for background jobs. The `pipeline` constructor already searches for trailing `&`’s and records whether or not the pipeline should be run in the background. If it does, then you still add information about the job to the job list, but you immediately come back to the shell prompt without waiting.
+
+10. Add support for `slay`, `halt`, `cont` (the process-oriented commands) and `bg` (which prompts all processes in a single job to continue in the background), and use some of the sample user programs included in your repo (`int`, `fpe`, `tstp`, `spin`, `split`) to test all of these.
+
+The following are additional milestones you need to hit on your way to a fully functional stsh. Each of these bullet points represents something larger.
+
+* Add support for foreground jobs whose leading process (e.g. `cat`, `more`, `emacs`, `vi`, and other executables requiring elaborate control of the console) requires control of the terminal. You should investigate the `tcsetpgrp` function as a way of transferring terminal control to a process group, and update your solution to always call it, even if it fails. If `tcsetpgrp(STDIN_FILENO, pgid)` succeeds, then it’ll return `0`. If it fails with a return value of `-1` but it sets errno to `ENOTTY`, that just means that your `stsh` instance didn’t have control of the terminal or the authority to donate it to another process group. If it fails with a different errno value, then that’s a more serious problem that should be identified via an `STSHException`. If `stsh` succeeds to transferring control to the foreground process group, then `stsh` should take control back when that group falls out of the foreground (perhaps because it exits, or it stops, or something else).
+
+* Add support for pipelines consisting of two processes (i.e. binary pipelines, e.g `cat /usr/include/stdio.h | wc`). Make sure that the standard output of the first is piped to the standard input of the second, and that each of the two processes are part of the same process group, using a process group ID that is identical to the pid of the leading process. Do simple error checking: You can assume that all system calls succeed, with the exception of `execvp`, which may fail because of user error (misspelled executable name, file isn’t an executable, lack of permissions, etc.). You might want to include more error checking if it helps you triage bugs, assert the truth of certain expectations during execution, and arrive at a working product more quickly. (Hint: the `conduit` user program in your repo starts to become useful as soon as you deal with nontrivial pipelines. Try typing `echo 12345 | ./conduit --delay 1` in the standard shell to see what happens, and try to replicate the behavior in `stsh`.)
+
+* When pipelines of one and two processes work, get arbitrarily long pipeline chains to do the right thing. So, if the user types in `echo 12345 | ./conduit --delay 1 | ./conduit | ./conduit`, four processes are created, each with their own pid, and all in a process group whose process group id is that of the leading process (in this case, the one running `echo`). `echo`’s standard out feeds the standard in of the first `conduit`, whose standard out feeds into the standard in of the second `conduit`, which pipes its output to the standard input of the last `conduit`, which at last prints to the console. The code needed to realize pipelines of three or more doesn’t have as much in common with the binary pipeline code as one might think. There are `pipe`, `setpgid`, `dup2`, `close`, and `execvp` calls, but figuring out how to get one of the inner processes to redefine what `STDIN_FILENO` and `STDOUT_FILENO` are connected to is very tricky, and this trickiness doesn’t present itself in the binary pipeline.
+
+* Finally, add support for input and output redirection via `<` and `>` (e.g. `cat < /usr/include/stdio.h | wc > output.txt`). The names of input and output redirection files are surfaced by the pipeline constructor, and if there is a nonempty string in the `input` and/or `output` fields of the pipeline record, that’s the signal that input redirection, output redirection, or both are needed. If the file one is writing to doesn’t exist, create it, and go with `0644` (with the leading zero) as the octal constant to establish the `rw-r -- r--` permission. If the output file you’re redirecting to already exists, then truncate it using the `O_TRUNC` flag. Note that input redirection always impacts where the leading process draws its input from and that output redirection influences where the caboose process publishes its output. Sometimes those two processes are the same, and sometimes they are different. Type `man 2 open` for information on the open system call and a reminder of what flags can be bitwise-OR’ed together for the second argument.
+
+### Hints
+
+* Your implementation should be in C++ unless there’s no way to avoid it: You should use C++ strings unless you interface with a system call that requires C strings, use `cout` instead of `printf`, and so forth. Understand that when you redefine where `STDOUT_FILENO` directs its text, that impacts where `printf` (which you’re not using) and `cout` (which you are) place that text.
+
+* In general, your error checking should guard against user error – attempts to invoke a nonexistent executable, providing out-of-range arguments to command-line built-ins, and so forth. In some cases – as pointed out in this handout – you do need to check the return value of a system call or two, because sometimes system call *failure* (the air quotes are intentional) isn’t really a failure at all. You may have seen situations where `waitpid` returns -1 even though everything was fine, and that happens with a few other system calls as well.
+
+* All unused file descriptors should be closed.
+
+* When creating a pipeline – whether it consists of a single process, two processes, or many, many processes – you need to ensure that all of the pipeline processes are in the same process group, but in a different process group than the `stsh` instance is. To support this, you should investigate `setpgid` to see how all of the sibling processes in a pipeline can be added to a new process group whose id is the same as the pid of the leading process. So, if a pipeline consists of four processes with pids `4004`, `4005`, `4007`, and `4008`, they would all be placed in a process group with an ID of `4004`. By doing this, you can send a signal to every process in a group using the `kill` function, where the first argument is the negative of the process group id (e.g. `kill(-4004, SIGTSTP)`). In order to avoid some race conditions, you should call `setpgid` in the parent and in each of the children. Why does the parent need to call it? Because it needs to ensure the process group exists before it advances on to add other processes in the pipeline to the same group. Why do child processes need to call it? Because if the child relies on the parent to do it, the child may `execvp` (and invalidate its own pid as a valid `setpgid` argument) before the parent gets around to it. Race conditions!!
+
+* You **do not need** to support pipelines or redirection for any of the builtins. In principle, you should be able to, say, redirect the output of `jobs` to a file, or pipe the output to another process, but you don’t need to worry about this in this assignment.
+
+* Every time the `SIGCHLD` handler learns of a stopped or terminated process, it’s possible the surrounding job is impacted. Investigate the `STSHJobList::synchronize(STSHJob& job)` method, which scrutinizes the supplied job to see if it should be removed from the job list or if it should demote itself to the background.
+
+* We’ve defined one global variable for you (the `STSHJobList` called `joblist`). You may not declare any others unless they are constants.
+
+* Make sure pipelines of multiple commands work even when the processes spawned on their behalf ignore standard in and standard out, e.g. `sleep 10 | sleep 10 | sleep 10 | sleep 10 > empty-output.txt` should run just fine – the entire pipeline lasts for about 10 seconds, and `empty-output.txt` is created or truncated and ends up being 0 bytes.
+
+* When an entire pipeline is run as a background job, make sure you print out a job summary that’s consistent with the following output:
+
+    ``` {.bash{}}
+    stsh> sleep 10 | sleep 10 | sleep 10 &
+    [1] 27684 27685 27686
+    ```
+* You don’t need to guard against the possibility of the child process executing and exiting before the parent has a chance to add it to the job list.
+
+:tada: Congratulations!

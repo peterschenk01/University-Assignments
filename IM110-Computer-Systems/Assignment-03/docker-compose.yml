@@ -1,0 +1,11 @@
+services:
+  assignment03:
+    container_name: cs110_assignment03
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
